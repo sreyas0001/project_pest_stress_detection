@@ -19,33 +19,104 @@ class MultispectralImage:
     """
     
     BAND_MAP = {
-        'Blue': 0,
-        'Green': 1,
-        'Red': 2,
-        'RedEdge': 3,
-        'NIR': 4
+        'Green': 0,
+        'Red': 1,
+        'RedEdge': 2,
+        'NIR': 3
     }
 
     def __init__(self, filepath, load_full=True):
-        self.filepath = filepath
+        """
+        filepath: Path to ANY file in the set (e.g., ..._NIR.TIF or ..._RGB.JPG).
+                  The class will automatically find the sibling band files based on the prefix.
+        """
+        self.base_path = self._get_base_path(filepath)
         self.data = None
         self.profile = None
+        self.rgb_path = self.base_path + "_RGB.JPG"
+        
         if load_full:
             self.data, self.profile = self._load_image()
         
+    def _get_base_path(self, filepath):
+        # Assumes format: path/to/IMG_date_time_idx_BAND.EXT
+        # We want: path/to/IMG_date_time_idx
+        # Split by underscore and reassemble until the band identifier
+        dirname = os.path.dirname(filepath)
+        basename = os.path.basename(filepath)
+        
+        # Heuristic: split by '_' and assume the last part is the band/ext
+        # Example: IMG_250923_062403_0000_GRE.TIF -> prefix is everything before _GRE
+        parts = basename.rsplit('_', 1)
+        if len(parts) < 2:
+             raise ValueError(f"Filename {basename} does not match expected format IMG_..._BAND.ext")
+        
+        prefix = parts[0]
+        return os.path.join(dirname, prefix)
+
     def _load_image(self):
-        with rasterio.open(self.filepath) as src:
-            data = src.read() # (Bands, Height, Width)
-            profile = src.profile
+        # Load bands in order of BAND_MAP
+        bands = []
+        profile = None
+        
+        # Map internal indices to suffixes
+        # 0: Green -> _GRE.TIF
+        # 1: Red   -> _RED.TIF
+        # 2: RE    -> _REG.TIF
+        # 3: NIR   -> _NIR.TIF
+        suffix_map = {
+            0: '_GRE.TIF',
+            1: '_RED.TIF',
+            2: '_REG.TIF',
+            3: '_NIR.TIF'
+        }
+
+        first_band_loaded = False
+        
+        for idx in range(len(self.BAND_MAP)):
+            suffix = suffix_map[idx]
+            band_path = self.base_path + suffix
+            
+            if not os.path.exists(band_path):
+                # Try .tif lowercase just in case
+                band_path = self.base_path + suffix.replace('.TIF', '.tif')
+                if not os.path.exists(band_path):
+                    raise FileNotFoundError(f"Band file not found: {band_path}")
+
+            with rasterio.open(band_path) as src:
+                band_data = src.read(1) # Read the first (and only) band
+                bands.append(band_data)
+                
+                if not first_band_loaded:
+                    profile = src.profile
+                    first_band_loaded = True
+        
+        # Stack into (Count, H, W)
+        data = np.stack(bands, axis=0)
+        
+        # Update profile to reflect new band count
+        profile.update(count=data.shape[0])
+        
         return data, profile
 
     def read_window(self, x, y, width, height):
         from rasterio.windows import Window
-        with rasterio.open(self.filepath) as src:
-            window = Window(x, y, width, height)
-            data = src.read(window=window)
-        return data.astype(np.float32)
-
+        window = Window(x, y, width, height)
+        
+        bands = []
+        suffix_map = {0: '_GRE.TIF', 1: '_RED.TIF', 2: '_REG.TIF', 3: '_NIR.TIF'}
+        
+        for idx in range(len(self.BAND_MAP)):
+            suffix = suffix_map[idx]
+            band_path = self.base_path + suffix
+            if not os.path.exists(band_path):
+                 band_path = self.base_path + suffix.replace('.TIF', '.tif')
+            
+            with rasterio.open(band_path) as src:
+                b = src.read(1, window=window)
+                bands.append(b)
+                
+        return np.stack(bands).astype(np.float32)
 
     def get_band(self, band_name):
         idx = self.BAND_MAP.get(band_name)
@@ -78,17 +149,26 @@ class MultispectralImage:
         return numerator / denominator
 
     def get_rgb(self):
-        """Returns standard RGB image for visualization (Red, Green, Blue)"""
-        r = self.get_band('Red')
-        g = self.get_band('Green')
-        b = self.get_band('Blue')
+        """
+        Returns RGB image.
+        Since we don't have a Blue TIF band, we try to load the _RGB.JPG.
+        If unavailable, we return a False Color Composite (NIR, Red, Green).
+        """
+        if os.path.exists(self.rgb_path):
+            # Load the reference RGB JPG
+            # Note: This might have different resolution/registration than TIFs
+            img = cv2.imread(self.rgb_path)
+            if img is not None:
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        rgb = np.dstack((r, g, b))
+        # Fallback to False Color (NIR, Red, Green) which is commonly used in Ag
+        nir = self.get_band('NIR')
+        red = self.get_band('Red')
+        green = self.get_band('Green')
         
-        # Normalize to 0-255 for display if needed, or 0-1
-        # Simple min-max normalization for visualization
-        rgb_norm = (rgb - np.min(rgb)) / (np.max(rgb) - np.min(rgb) + 1e-8)
-        return (rgb_norm * 255).astype(np.uint8)
+        fcc = np.dstack((nir, red, green))
+        fcc_norm = (fcc - np.min(fcc)) / (np.max(fcc) - np.min(fcc) + 1e-8)
+        return (fcc_norm * 255).astype(np.uint8)
 
     def normalize(self):
         """Normalize all bands to 0-1 range"""
